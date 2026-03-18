@@ -58,6 +58,7 @@ public class PostgresXminHandler {
   private final XminStateManager xminStateManager;
 
   private static final Logger LOGGER = LoggerFactory.getLogger(PostgresXminHandler.class);
+  private static final String UPDATED_AT_FILTER = " AND \"updatedAt\" > now() - interval '2 days'";
 
   public PostgresXminHandler(final JdbcDatabase database,
                              final JdbcCompatibleSourceOperations sourceOperations,
@@ -187,11 +188,15 @@ public class PostgresXminHandler {
     } else {
       // The xmin state that we save represents the lowest XID that is still in progress. To make sure we
       // don't miss data associated with the current transaction, we have to issue an >=
-      final String sql = String.format("SELECT %s FROM %s WHERE xmin::text::bigint >= ?",
+      final boolean isInitialSync = (prevRunXminStatus == null);
+      final String baseSql = String.format("SELECT %s FROM %s WHERE xmin::text::bigint >= ?",
           wrappedColumnNames, fullTableName);
+      // Finaloop optimization: for non-initial syncs, add updatedAt filter to enable index scan
+      // instead of full table scan. Safe because xmin still guarantees correctness.
+      final String sql = isInitialSync ? baseSql : baseSql + UPDATED_AT_FILTER;
 
-      final PreparedStatement preparedStatement = connection.prepareStatement(sql.toString());
-      if (prevRunXminStatus != null) {
+      final PreparedStatement preparedStatement = connection.prepareStatement(sql);
+      if (!isInitialSync) {
         preparedStatement.setLong(1, prevRunXminStatus.getXminXidValue());
       } else {
         // In case ctid sync is not possible we will do the initial load using "WHERE xmin >= 0"
