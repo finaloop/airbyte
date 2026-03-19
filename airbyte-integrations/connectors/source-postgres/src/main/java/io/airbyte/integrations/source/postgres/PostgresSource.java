@@ -342,6 +342,7 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
         final List<AirbyteStream> streams = catalog.getStreams().stream()
             .map(stream -> PostgresCatalogHelper.overrideSyncModes(stream, viewsBySchema))
             .map(PostgresCatalogHelper::setIncrementalToSourceDefined)
+            .map(PostgresCatalogHelper::clearSourceDefinedPrimaryKey)
             .collect(toList());
         catalog.setStreams(streams);
       } catch (SQLException e) {

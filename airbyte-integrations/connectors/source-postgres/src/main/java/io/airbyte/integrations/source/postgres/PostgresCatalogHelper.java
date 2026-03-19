@@ -48,6 +48,15 @@ public final class PostgresCatalogHelper {
   }
 
   /**
+   * Finaloop: Clear source-defined primary keys so Airbyte accepts custom PKs
+   * (e.g. adding companyId) set via Terraform or the API.
+   */
+  public static AirbyteStream clearSourceDefinedPrimaryKey(final AirbyteStream stream) {
+    stream.setSourceDefinedPrimaryKey(Collections.emptyList());
+    return stream;
+  }
+
+  /**
    * This method is used for CDC sync in order to overwrite sync modes for cursor fields cause cdc use
    * another cursor logic
    *
