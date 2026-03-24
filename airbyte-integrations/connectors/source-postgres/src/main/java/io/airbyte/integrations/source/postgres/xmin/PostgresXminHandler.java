@@ -157,7 +157,7 @@ public class PostgresXminHandler {
       // Get the xmin status associated with the previous run
       final XminStatus previousRunXminStatus = xminStateManager.getXminStatus(airbyteStream);
       final PreparedStatement xminPreparedStatement =
-          getXminPreparedStatement(connection, wrappedColumnNames, fullTableName, previousRunXminStatus, currentXminStatus);
+          getXminPreparedStatement(connection, wrappedColumnNames, fullTableName, previousRunXminStatus, currentXminStatus, columnNames);
       LOGGER.info("Executing query for table {}: {}", tableName, xminPreparedStatement);
       return xminPreparedStatement;
     } catch (final SQLException e) {
@@ -169,7 +169,8 @@ public class PostgresXminHandler {
                                                      final String wrappedColumnNames,
                                                      final String fullTableName,
                                                      final XminStatus prevRunXminStatus,
-                                                     final XminStatus currentXminStatus)
+                                                     final XminStatus currentXminStatus,
+                                                     final List<String> rawColumnNames)
       throws SQLException {
 
     if (isSingleWraparound(prevRunXminStatus, currentXminStatus)) {
@@ -193,7 +194,12 @@ public class PostgresXminHandler {
           wrappedColumnNames, fullTableName);
       // Finaloop optimization: for non-initial syncs, add updatedAt filter to enable index scan
       // instead of full table scan. Safe because xmin still guarantees correctness.
-      final String sql = isInitialSync ? baseSql : baseSql + UPDATED_AT_FILTER;
+      // Only apply the filter if the table actually has an updatedAt column.
+      final boolean hasUpdatedAt = rawColumnNames.contains("updatedAt");
+      final String sql = (!isInitialSync && hasUpdatedAt) ? baseSql + UPDATED_AT_FILTER : baseSql;
+      if (!isInitialSync && !hasUpdatedAt) {
+        LOGGER.info("Table {} does not have updatedAt column, skipping updatedAt filter optimization", fullTableName);
+      }
 
       final PreparedStatement preparedStatement = connection.prepareStatement(sql);
       if (!isInitialSync) {
