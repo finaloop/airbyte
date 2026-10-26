@@ -4,7 +4,23 @@
 
 package io.airbyte.integrations.source.postgres;
 
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_COLUMN_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_COLUMN_SIZE;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_COLUMN_TYPE;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_COLUMN_TYPE_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_DECIMAL_DIGITS;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_IS_NULLABLE;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_SCHEMA_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_TABLE_NAME;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_COLUMN_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_DATABASE_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_DATA_TYPE;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_SCHEMA_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_SIZE;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_TABLE_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_TYPE_NAME;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_DECIMAL_DIGITS;
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_IS_NULLABLE;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_INDEX_NAME;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_INDEX_NON_UNIQUE;
 import static io.airbyte.cdk.db.jdbc.JdbcSSLConnectionUtils.CLIENT_KEY_STORE_PASS;
@@ -453,7 +469,7 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
       final List<TableInfo<CommonField<PostgresType>>> internals = new ArrayList<>();
       for (final String schema : schemas) {
         LOGGER.debug("Checking schema: {}", schema);
-        final List<TableInfo<CommonField<PostgresType>>> tables = super.discoverInternal(database, schema);
+        final List<TableInfo<CommonField<PostgresType>>> tables = discoverAccessibleTables(database, schema);
         internals.addAll(tables);
         for (final TableInfo<CommonField<PostgresType>> table : tables) {
           LOGGER.debug("Found table: {}.{}", table.getNameSpace(), table.getName());
@@ -464,6 +480,103 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
       LOGGER.info("No schemas explicitly set on UI to process, so will process all of existing schemas in DB");
       return super.discoverInternal(database);
     }
+  }
+
+  /**
+   * Same result as AbstractJdbcSource.discoverInternal(database, schema), but reads column metadata
+   * only for the tables the user can SELECT.
+   *
+   * Upstream calls getColumns(catalog, schema, null, null) for the whole schema, buffers every
+   * column, and only then drops tables without SELECT. In a schema with many tables or partitions
+   * the user cannot read, discovery holds all of their columns in memory to keep a small fraction,
+   * and can run out of memory.
+   *
+   * Columns still come from DatabaseMetaData.getColumns, one call per table, so the field
+   * metadata (and therefore the discovered catalog) is identical to upstream.
+   */
+  private List<TableInfo<CommonField<PostgresType>>> discoverAccessibleTables(final JdbcDatabase database,
+                                                                              final String schema)
+      throws Exception {
+    final Set<String> internalSchemas = new java.util.HashSet<>(getExcludedInternalNameSpaces());
+    final List<JdbcPrivilegeDto> tables = getPrivilegesTableForCurrentUser(database, schema).stream()
+        .filter(t -> !internalSchemas.contains(t.getSchemaName()))
+        .sorted(java.util.Comparator.comparing(JdbcPrivilegeDto::getSchemaName)
+            .thenComparing(JdbcPrivilegeDto::getTableName))
+        .collect(toList());
+    if (tables.isEmpty()) {
+      // Upstream treats "no privileges found" as "keep every non-internal table". Keep that behaviour.
+      return super.discoverInternal(database, schema);
+    }
+    LOGGER.info("Discovering columns for {} accessible tables in schema {}", tables.size(), schema);
+
+    final String catalog = database.getSourceConfig() != null && database.getSourceConfig().has(JdbcUtils.DATABASE_KEY)
+        ? database.getSourceConfig().get(JdbcUtils.DATABASE_KEY).asText()
+        : null;
+    final List<TableInfo<CommonField<PostgresType>>> result = new ArrayList<>();
+    for (final JdbcPrivilegeDto table : tables) {
+      final List<JsonNode> columns = database.bufferedResultSetQuery(
+          connection -> {
+            final java.sql.DatabaseMetaData metaData = connection.getMetaData();
+            final String escape = metaData.getSearchStringEscape();
+            // getColumns takes LIKE patterns: escape "_" and "%" so "Foo_Bar" can't match "FooXBar"
+            return metaData.getColumns(catalog, escapeLikePattern(table.getSchemaName(), escape),
+                escapeLikePattern(table.getTableName(), escape), null);
+          },
+          PostgresSource::columnMetadata)
+          .stream()
+          .filter(c -> table.getSchemaName().equals(c.get(INTERNAL_SCHEMA_NAME).asText())
+              && table.getTableName().equals(c.get(INTERNAL_TABLE_NAME).asText()))
+          .collect(toList());
+      if (!columns.isEmpty()) {
+        result.add(toTableInfo(columns));
+      }
+    }
+    return result;
+  }
+
+  private static String escapeLikePattern(final String value, final String escape) {
+    if (escape == null || escape.isEmpty()) {
+      return value;
+    }
+    return value.replace(escape, escape + escape).replace("_", escape + "_").replace("%", escape + "%");
+  }
+
+  // Copy of the private AbstractJdbcSource.getColumnMetadata (CDK 0.48).
+  private static JsonNode columnMetadata(final ResultSet resultSet) throws SQLException {
+    final ImmutableMap.Builder<String, Object> fieldMap = ImmutableMap.<String, Object>builder()
+        .put(INTERNAL_SCHEMA_NAME, resultSet.getObject(JDBC_COLUMN_SCHEMA_NAME) != null
+            ? resultSet.getString(JDBC_COLUMN_SCHEMA_NAME)
+            : resultSet.getObject(JDBC_COLUMN_DATABASE_NAME))
+        .put(INTERNAL_TABLE_NAME, resultSet.getString(JDBC_COLUMN_TABLE_NAME))
+        .put(INTERNAL_COLUMN_NAME, resultSet.getString(JDBC_COLUMN_COLUMN_NAME))
+        .put(INTERNAL_COLUMN_TYPE, resultSet.getString(JDBC_COLUMN_DATA_TYPE))
+        .put(INTERNAL_COLUMN_TYPE_NAME, resultSet.getString(JDBC_COLUMN_TYPE_NAME))
+        .put(INTERNAL_COLUMN_SIZE, resultSet.getInt(JDBC_COLUMN_SIZE))
+        .put(INTERNAL_IS_NULLABLE, resultSet.getString(JDBC_IS_NULLABLE));
+    if (resultSet.getString(JDBC_DECIMAL_DIGITS) != null) {
+      fieldMap.put(INTERNAL_DECIMAL_DIGITS, resultSet.getString(JDBC_DECIMAL_DIGITS));
+    }
+    return Jsons.jsonNode(fieldMap.build());
+  }
+
+  // Copy of the private AbstractJdbcSource.jsonFieldListToTableInfo (CDK 0.48).
+  private TableInfo<CommonField<PostgresType>> toTableInfo(final List<JsonNode> fields) {
+    final List<CommonField<PostgresType>> commonFields = new ArrayList<>();
+    final List<String> cursorFields = new ArrayList<>();
+    for (final JsonNode f : fields) {
+      final PostgresType datatype = sourceOperations.getDatabaseFieldType(f);
+      final String name = f.get(INTERNAL_COLUMN_NAME).asText();
+      commonFields.add(new CommonField<PostgresType>(name, datatype) {});
+      if (isCursorType(datatype)) {
+        cursorFields.add(name);
+      }
+    }
+    return new TableInfo<>(
+        fields.get(0).get(INTERNAL_SCHEMA_NAME).asText(),
+        fields.get(0).get(INTERNAL_TABLE_NAME).asText(),
+        commonFields,
+        List.of(),
+        cursorFields);
   }
 
   @VisibleForTesting
@@ -691,6 +804,8 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
                  AND    has_schema_privilege(current_user, nspname, 'USAGE')
                  -- r = ordinary table, i = index, S = sequence, t = TOAST table, v = view, m = materialized view, c = composite type, f = foreign table, p = partitioned table, I = partitioned index
                  AND    relkind in ('r', 'm', 'v', 't', 'f', 'p')
+                 -- partitions are synced through their parent; never discover them on their own
+                 AND    NOT c.relispartition
                  and    ((? is null) OR nspname = ?)
           """);
       ps.setString(1, schema);
